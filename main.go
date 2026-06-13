@@ -2,9 +2,9 @@ package main
 
 import (
 	"flag"
-	"log"
 	"go-redis-server/config"
 	"go-redis-server/server"
+	"log"
 )
 
 func setupFlags() {
@@ -15,6 +15,9 @@ func setupFlags() {
 
 func main() {
 	setupFlags()
-	log.Println("rolling the dice 🎲")
-	server.RunSyncTCPServer()
+	log.Println("***** genesis *****")
+	err := server.RunAsyncTCPServerDarwin()
+	if err != nil {
+		log.Println("err", err)
+	}
 }

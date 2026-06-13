@@ -66,6 +66,7 @@ func readBulkString(data []byte) (string, int, error) {
 	pos += delta
 
 	// reading `len` bytes as string
+	fmt.Println("bulk str lens", pos+len+2, data[pos:(pos+len)])
 	return string(data[pos:(pos + len)]), pos + len + 2, nil
 }
 
@@ -118,11 +119,26 @@ func Decode(data []byte) (interface{}, error) {
 	return value, err
 }
 
-func Encode(cmd Command) ([]byte, error) {
+func Encode(cmd *RedisCmd) ([]byte, error) {
 	switch cmd.Cmd {
 	case "PING":
 		return []byte("+PONG\r\n"), nil
 	default:
 		return []byte("$-1\r\n"), nil
 	}
+}
+
+func DecodeArrayString(data []byte) ([]string, error) {
+	value, err := Decode(data)
+	if err != nil {
+		return nil, err
+	}
+
+	ts := value.([]interface{})
+	tokens := make([]string, len(ts))
+	for i := range tokens {
+		tokens[i] = ts[i].(string)
+	}
+
+	return tokens, nil
 }

@@ -1,6 +1,6 @@
 package core
 
-type Command struct {
+type RedisCmd struct {
 	Cmd  string
 	Args []string
 }
