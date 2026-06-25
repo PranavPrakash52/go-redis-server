@@ -5,6 +5,8 @@ import (
 	"fmt"
 )
 
+var keyvalue map[string]interface{} = make(map[string]interface{})
+
 // reads the length typically the first integer of the string
 // until hit by an non-digit byte and returns
 // the integer and the delta = length + 2 (CRLF)
@@ -119,10 +121,53 @@ func Decode(data []byte) (interface{}, error) {
 	return value, err
 }
 
+func handleSet(cmd *RedisCmd) error {
+	if len(cmd.Args) < 1 {
+		return errors.New("SET command requires 2 arguments")
+	}
+	key := cmd.Cmd
+	value := cmd.Args[1]
+	keyvalue[key] = value
+	return nil
+}
+
+func handleGet(cmd *RedisCmd) (interface{}, error) {
+	if len(cmd.Args) < 1 {
+		return nil, errors.New("GET command requires 1 argument")
+	}
+	key := cmd.Args[0]
+	value, ok := keyvalue[key]
+	if !ok {
+		return nil, nil
+	}
+	return value, nil
+}
+
 func Encode(cmd *RedisCmd) ([]byte, error) {
 	switch cmd.Cmd {
 	case "PING":
 		return []byte("+PONG\r\n"), nil
+
+	case "SET":
+		if len(cmd.Args) < 1 {
+			return nil, errors.New("SET command requires 2 arguments")
+		}
+		err := handleSet(cmd)
+		if err != nil {
+			return nil, err
+		}
+		return []byte("+OK\r\n"), nil
+
+	case "GET":
+		val, err := handleGet(cmd)
+		if err != nil {
+			return nil, err
+		}
+		if val == nil {
+			return []byte("$-1\r\n"), nil
+		}
+		return []byte(fmt.Sprintf("$%d\r\n%s\r\n", len(val.(string)), val.(string))), nil
+
 	default:
 		return []byte("$-1\r\n"), nil
 	}

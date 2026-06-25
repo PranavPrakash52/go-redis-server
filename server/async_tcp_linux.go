@@ -103,7 +103,7 @@ func RunAsyncTCPServerLinux() error {
 					con_clients -= 1
 					continue
 				}
-				respond(cmd, comm)
+				core.EvalAndRespond(cmd, comm)
 			}
 		}
 	}

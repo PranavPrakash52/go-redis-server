@@ -91,7 +91,7 @@ func RunAsyncTCPServerDarwin() error {
 					syscall.Close(int(events[i].Ident))
 					continue
 				}
-				respond(cmd, comm)
+				core.EvalAndRespond(cmd, comm)
 			}
 		}
 
