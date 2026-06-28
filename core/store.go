@@ -1,6 +1,7 @@
 package core
 
 import (
+	"go-redis-server/config"
 	"time"
 )
 
@@ -49,4 +50,44 @@ func Del(k string) int {
 		return 1
 	}
 	return 0
+}
+
+func ClearExpired() {
+	for {
+		// Pick up to sampleSize random keys from the store.
+		// Go map iteration order is randomized, so the first N keys
+		// encountered form an effectively random sample.
+		keys := make([]string, 0, config.SampleSize)
+		for k := range store {
+			keys = append(keys, k)
+			if len(keys) >= config.SampleSize {
+				break
+			}
+		}
+
+		if len(keys) == 0 {
+			return
+		}
+
+		now := time.Now().UnixMilli()
+		deleted := 0
+
+		for _, k := range keys {
+			obj, ok := store[k]
+			if !ok {
+				continue
+			}
+			if obj.ExpiresAt != -1 && obj.ExpiresAt <= now {
+				delete(store, k)
+				deleted++
+			}
+		}
+
+		// If more than ActiveExpireThresholdPercent% of the sampled keys were expired,
+		// repeat the sampling to proactively reclaim memory under heavy TTL churn.
+		// Expressed as a percentage so it stays correct regardless of SampleSize.
+		if float64(deleted)/float64(len(keys)) <= float64(config.ActiveExpireThresholdPercent)/100 {
+			return
+		}
+	}
 }

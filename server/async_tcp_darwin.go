@@ -5,9 +5,12 @@ import (
 	"go-redis-server/core"
 	"net"
 	"syscall"
+	"time"
 )
 
 func RunAsyncTCPServerDarwin() error {
+
+	lastCronTime := time.Now().UnixMilli()
 
 	var max_clients int = 20000
 
@@ -62,6 +65,10 @@ func RunAsyncTCPServerDarwin() error {
 	}
 
 	for {
+		if time.Now().After(time.UnixMilli(lastCronTime + int64(config.CronInterval))) {
+			lastCronTime = time.Now().UnixMilli()
+			core.ClearExpired()
+		}
 
 		nevents, err := syscall.Kevent(kqueueFD, nil, events[:], nil)
 		if err != nil {
