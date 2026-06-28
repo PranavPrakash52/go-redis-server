@@ -67,12 +67,65 @@ The mapping from your application's integer FD to the actual hardware happens in
 3. **The Inode Table / Socket Structure (Kernel-level):** This is the actual representation of the underlying hardware or memory. For networking, it points to a `socket` data structure in the kernel memory, which holds the actual receive and send buffers where the network card places incoming data.
 
 ### How Does the OS Know Which Process to Wake Up?
-When you call `epoll_wait()`, your process essentially tells the kernel: *"Put me to sleep, but add me to the wait queue for these specific sockets."*
+The key insight is that **registration** (`epoll_ctl`) and **waiting** (`epoll_wait`) are two separate acts, and they touch **two different wait queues**. Crucially, it is *not* your process that gets attached to a socket — it is the `epoll` instance. Your process only enters a wait queue at the moment it actually calls `epoll_wait()`.
 
-1. **Wait Queues:** Every `socket` structure in the kernel (layer 3 in the map above) has a **Wait Queue** attached to it. When `epoll_ctl` is used to monitor a socket, your process is linked to that socket's wait queue.
-2. **The Interrupt:** Data arrives at the network card, triggering a hardware interrupt.
-3. **Waking Up:** The kernel handles the interrupt and copies the data into the socket's receive buffer. The kernel then checks the socket's Wait Queue, sees that your process's `epoll` instance is waiting for data on this socket, and changes your process's state from "sleeping" to "runnable".
-4. The OS scheduler then gives your process CPU time, and `epoll_wait()` unblocks, returning the specific FDs that triggered the wake-up so you can read them.
+#### The Registration Step (`epoll_ctl`)
+When you call `epoll_ctl(epfd, EPOLL_CTL_ADD, sock_fd, ...)`, the kernel:
+1. Creates a small struct called an **`epitem`** that links your `epoll` instance (internally an `eventpoll` struct) to this specific socket.
+2. Inserts an entry into the **socket's Wait Queue** (`sk_wq` in kernel terms). That entry carries a callback function called **`ep_poll_callback`**.
+
+So what literally sits in the socket's wait queue is **not your process, and not the `epoll_fd` integer** — it is a callback entry that says: *"If data arrives here, fire `ep_poll_callback`, which knows which `epitem` / `eventpoll` I belong to."*
+
+This registration is **persistent** and survives across many `epoll_wait` calls. If you register 1,000 sockets with one `epoll` instance, then all 1,000 sockets have a callback entry in their wait queue, all pointing back to the same `eventpoll`.
+
+#### `epoll_event` (Your Code) vs `epitem` (The Kernel)
+There is a common point of confusion here worth clearing up. In your Go code (see `server/async_tcp_linux.go`), you write something like:
+
+```go
+var socketServerEvent syscall.EpollEvent = syscall.EpollEvent{
+    Events: syscall.EPOLLIN, // listen for read events on the server socket
+    Fd:     int32(serverFD),
+}
+syscall.EpollCtl(epollFD, syscall.EPOLL_CTL_ADD, serverFD, &socketServerEvent)
+```
+
+You might wonder: *isn't this `epoll_event` the thing being added to the queue? Where is the callback?*
+
+**No.** `epoll_event` is just a **message** you hand to the kernel — a small payload describing what you want. The kernel never puts your user-space struct into any queue. Instead, it reads your `epoll_event` and builds its own kernel-side object, the **`epitem`**. They look related but live in different worlds:
+
+| | `syscall.EpollEvent` (your Go code) | `epitem` (kernel, you never see it) |
+|---|---|---|
+| Where it lives | User space | Kernel space |
+| What it holds | `Events` (e.g. `EPOLLIN`), `Fd` | copy of those events + `data`, a link to the `eventpoll`, a link to the socket, **and the `ep_poll_callback` entry** |
+| Who creates it | Your code | The kernel, *inside* the `epoll_ctl` syscall |
+
+That is why you don't see a callback: **you cannot register one from user space.** The callback is a hardcoded kernel function (`ep_poll_callback`), identical for every `epoll` registration in every process. The kernel attaches it itself.
+
+So is `epoll_event` "part of" the `epitem`? Only its **contents** are — the `Events` mask and the `Fd`/`data` field get **copied into** the `epitem`. After the syscall returns, your Go `socketServerEvent` is just a regular local variable; nothing in the kernel points back at your user-space memory. The `epitem` is the larger kernel object that carries those copied fields *plus* the callback and the linkage.
+
+#### Why the `Fd` Field Matters
+The `Fd: int32(serverFD)` you set is not just decoration — it becomes the **`data`** the kernel stores inside the `epitem`. Later, when `epoll_wait` wakes you up, the kernel fills your `events` array with fresh `epoll_event`s and echoes that `Fd` back, so your loop knows exactly which connection to `read()`:
+
+```go
+fd := events[i].Fd   // "ah, this FD has data ready"
+```
+
+That is the full round-trip: you hand the kernel `Fd` at registration → it is stored in the `epitem` → it is handed back to you at wake-up.
+
+#### The Waiting Step (`epoll_wait`)
+When your process calls `epoll_wait()`, *that* is the moment your process gets added to a wait queue — but a **different one**: the `eventpoll`'s own wait queue (`eventpoll->wq`). Your process goes to sleep there.
+
+#### The Wake-Up Chain
+Now the full flow when a packet arrives:
+
+1. **Hardware Interrupt:** Data arrives at the NIC, triggering an interrupt.
+2. **Kernel Buffer Copy:** The kernel copies the data into the socket's receive buffer.
+3. **Fire Callback:** The kernel walks the socket's Wait Queue and invokes `ep_poll_callback`.
+4. **Update Ready List:** `ep_poll_callback` adds the relevant `epitem` to the `eventpoll`'s **Ready List** (`rdllist`).
+5. **Wake the Process:** `ep_poll_callback` also wakes up any process sleeping on `eventpoll->wq`, changing its state from "sleeping" to "runnable".
+6. **Return:** The OS scheduler gives your process CPU time; `epoll_wait()` unblocks and hands you the specific FDs that triggered the wake-up so you can read them.
+
+Notice the clean separation of concerns: the socket only knows "someone cares about me" (via the callback), and the `eventpoll` is what actually tracks which process to wake and which FDs are ready.
 
 ## 7. Architectural Design: One `epoll` vs. Multiple `epoll`s
 A common architectural question arises when dealing with thousands of connections: *Should we use one `epoll` instance for everything, or two separate instances (one for the Server Socket to accept connections, and one for the Client Sockets to handle data)?*
@@ -123,9 +176,10 @@ If 4 processes are waiting in the Wait Queue for a Server Socket, and a single c
 Modern Linux kernels introduced the `EPOLLEXCLUSIVE` flag. When you attach an `epoll` to a socket with this flag, you instruct the kernel to only wake up **one** exclusive waiter from the Wait Queue, completely solving the Thundering Herd issue. This is how high-performance multi-process servers like Nginx operate.
 
 ## 10. Advanced Internals: The `epoll` Ready List vs. Socket Wait Queues
-It is critical to distinguish between the two different queues involved in I/O Multiplexing:
-1. **The Wait Queue (Belongs to the Socket):** This keeps track of *who* cares about the socket. It is a list of processes/epoll instances waiting for data.
-2. **The Ready List (Belongs to the `epoll` instance):** This keeps track of *which File Descriptors* currently have data ready to be read.
+It is critical to distinguish between the **three** different queues involved in I/O Multiplexing:
+1. **The Socket Wait Queue (`sk_wq`, belongs to each socket):** This keeps track of *who* is interested in this socket. Its entries are **callback entries** (`ep_poll_callback`), one per `epoll` instance monitoring the socket — not raw processes and not the `epoll_fd` integer.
+2. **The Eventpoll Wait Queue (`eventpoll->wq`, belongs to the `epoll` instance):** This holds the **process(es)** that are currently sleeping inside `epoll_wait()`.
+3. **The Ready List (`eventpoll->rdllist`, belongs to the `epoll` instance):** This keeps track of *which File Descriptors* currently have data ready to be read.
 
 ### The True Flow of an Interrupt
 What happens if your application is awake and processing 5 File Descriptors, and suddenly data arrives for a 6th File Descriptor?

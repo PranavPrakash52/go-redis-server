@@ -57,7 +57,7 @@ func RunAsyncTCPServerLinux() error {
 	// Specify the events we want to get hints about
 	// and set the socket on which
 	var socketServerEvent syscall.EpollEvent = syscall.EpollEvent{
-		Events: syscall.EPOLLIN,
+		Events: syscall.EPOLLIN, // listen for read events on the server socket
 		Fd:     int32(serverFD),
 	}
 
