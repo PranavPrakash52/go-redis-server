@@ -1,6 +1,7 @@
 package core
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"strconv"
@@ -76,6 +77,36 @@ func evalTTL(args []string, c io.ReadWriter) error {
 	return nil
 }
 
+func evalDEL(args []string, c io.ReadWriter) error {
+	couter := 0
+	checkArguementCount(args, 2, c)
+	for _, value := range args {
+		couter += Del(value)
+	}
+	c.Write([]byte(fmt.Sprintf("+%v\r\n", couter)))
+	return nil
+}
+
+func evalEXPIRE(args []string, c io.ReadWriter) error {
+	checkArguementCount(args, 1, c)
+	key := args[0]
+	expiry := args[1]
+	obj := Get(key)
+	if obj == nil {
+		c.Write([]byte(":0\r\n"))
+		return nil
+	}
+	expiry_in_secs, err := strconv.ParseInt(expiry, 10, 64)
+	if err != nil {
+		return errors.New("(error) ERR value is not an integer or out of range")
+	}
+
+	expiry_in_secs = expiry_in_secs * 1000
+	obj.ExpiresAt = time.Now().UnixMilli() + expiry_in_secs
+	c.Write([]byte(":1\r\n"))
+	return nil
+}
+
 func EvalAndRespond(cmd *RedisCmd, c io.ReadWriter) error {
 	switch cmd.Cmd {
 	case "PING":
@@ -86,6 +117,10 @@ func EvalAndRespond(cmd *RedisCmd, c io.ReadWriter) error {
 		return evalGET(cmd.Args, c)
 	case "TTL":
 		return evalTTL(cmd.Args, c)
+	case "DEL":
+		return evalDEL(cmd.Args, c)
+	case "EXPIRE":
+		return evalEXPIRE(cmd.Args, c)
 	default:
 		return evalPING(c)
 	}

@@ -41,3 +41,12 @@ func Get(k string) *Obj {
 	}
 	return v
 }
+
+func Del(k string) int {
+	v := store[k]
+	if v != nil {
+		delete(store, k)
+		return 1
+	}
+	return 0
+}
