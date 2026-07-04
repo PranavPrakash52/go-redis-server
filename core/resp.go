@@ -5,7 +5,28 @@ import (
 	"fmt"
 )
 
-var keyvalue map[string]interface{} = make(map[string]interface{})
+// Encode serializes a value into its RESP-encoded byte representation.
+// Supported value types:
+//   - string  -> RESP simple string  (+<s>\r\n)
+//   - int64   -> RESP integer        (:<n>\r\n)
+//   - nil     -> RESP null bulk string ($-1\r\n)
+//   - error   -> RESP error          (-<msg>\r\n)
+func Encode(v interface{}) []byte {
+	switch v := v.(type) {
+	case nil:
+		return []byte("$-1\r\n")
+	case string:
+		return []byte(fmt.Sprintf("+%s\r\n", v))
+	case int:
+		return []byte(fmt.Sprintf(":%d\r\n", v))
+	case int64:
+		return []byte(fmt.Sprintf(":%d\r\n", v))
+	case error:
+		return []byte(fmt.Sprintf("-%s\r\n", v.Error()))
+	default:
+		return []byte(fmt.Sprintf("+%v\r\n", v))
+	}
+}
 
 // reads the length typically the first integer of the string
 // until hit by an non-digit byte and returns
@@ -18,7 +39,6 @@ func readLength(data []byte) (int, int) {
 		if !(b >= '0' && b <= '9') {
 			return length, pos + 2
 		}
-		fmt.Println("length before", length, b)
 		length = length*10 + int(b-'0')
 	}
 	return 0, 0
@@ -68,7 +88,6 @@ func readBulkString(data []byte) (string, int, error) {
 	pos += delta
 
 	// reading `len` bytes as string
-	fmt.Println("bulk str lens", pos+len+2, data[pos:(pos+len)])
 	return string(data[pos:(pos + len)]), pos + len + 2, nil
 }
 
@@ -113,77 +132,36 @@ func DecodeOne(data []byte) (interface{}, int, error) {
 	return nil, 0, nil
 }
 
-func Decode(data []byte) (interface{}, error) {
+func Decode(data []byte) ([]interface{}, error) {
+	var command_array []interface{}
 	if len(data) == 0 {
 		return nil, errors.New("no data")
 	}
-	value, _, err := DecodeOne(data)
-	return value, err
-}
-
-func handleSet(cmd *RedisCmd) error {
-	if len(cmd.Args) < 1 {
-		return errors.New("SET command requires 2 arguments")
-	}
-	key := cmd.Cmd
-	value := cmd.Args[1]
-	keyvalue[key] = value
-	return nil
-}
-
-func handleGet(cmd *RedisCmd) (interface{}, error) {
-	if len(cmd.Args) < 1 {
-		return nil, errors.New("GET command requires 1 argument")
-	}
-	key := cmd.Args[0]
-	value, ok := keyvalue[key]
-	if !ok {
-		return nil, nil
-	}
-	return value, nil
-}
-
-func Encode(cmd *RedisCmd) ([]byte, error) {
-	switch cmd.Cmd {
-	case "PING":
-		return []byte("+PONG\r\n"), nil
-
-	case "SET":
-		if len(cmd.Args) < 1 {
-			return nil, errors.New("SET command requires 2 arguments")
-		}
-		err := handleSet(cmd)
+	for len(data) > 0 {
+		value, delta, err := DecodeOne(data)
 		if err != nil {
-			return nil, err
+			return nil, errors.New("no data")
 		}
-		return []byte("+OK\r\n"), nil
-
-	case "GET":
-		val, err := handleGet(cmd)
-		if err != nil {
-			return nil, err
-		}
-		if val == nil {
-			return []byte("$-1\r\n"), nil
-		}
-		return []byte(fmt.Sprintf("$%d\r\n%s\r\n", len(val.(string)), val.(string))), nil
-
-	default:
-		return []byte("$-1\r\n"), nil
+		command_array = append(command_array, value)
+		data = data[delta:]
 	}
+	return command_array, nil
 }
 
-func DecodeArrayString(data []byte) ([]string, error) {
-	value, err := Decode(data)
+func DecodeArrayString(data []byte) ([][]string, error) {
+	var command_array [][]string
+	value_array, err := Decode(data)
 	if err != nil {
 		return nil, err
 	}
-
-	ts := value.([]interface{})
-	tokens := make([]string, len(ts))
-	for i := range tokens {
-		tokens[i] = ts[i].(string)
+	for _, elem := range value_array {
+		ts := elem.([]interface{})
+		tokens := make([]string, len(ts))
+		for i := range tokens {
+			tokens[i] = ts[i].(string)
+		}
+		command_array = append(command_array, tokens)
 	}
 
-	return tokens, nil
+	return command_array, nil
 }

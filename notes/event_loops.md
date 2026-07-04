@@ -78,6 +78,68 @@ So what literally sits in the socket's wait queue is **not your process, and not
 
 This registration is **persistent** and survives across many `epoll_wait` calls. If you register 1,000 sockets with one `epoll` instance, then all 1,000 sockets have a callback entry in their wait queue, all pointing back to the same `eventpoll`.
 
+#### Inside the Kernel: What Exactly *Is* an `eventpoll`?
+A natural question at this point: *is `eventpoll` a queue? Is there one per socket? Where does it live?* All three have answers that are easy to get backwards, so let's pin them down.
+
+**`eventpoll` is a `struct`, not a queue.** It is a plain C `struct` defined in the kernel (`fs/eventpoll.c`). It is the kernel-side object that represents *one* `epoll` instance. It *contains* several queues/lists as fields inside it, but it is not itself a queue.
+
+**There is exactly ONE `eventpoll` per `epoll` instance — not per socket.** This is the part that is easy to invert. The per-socket object is the **`epitem`**, not the `eventpoll`. The cardinality is:
+
+```
+epoll_create1()  ──►  exactly ONE  struct eventpoll
+
+epoll_ctl(ADD)   ──►  exactly ONE  struct epitem  per (epoll_instance, fd)
+                        └─► inserted into that eventpoll's rbr (RB-tree)
+                        └─► also gets a callback entry pushed into the socket's sk_wq
+```
+
+So if you register 1,000 sockets onto one `epoll` instance, you get: **1** `eventpoll`, **1,000** `epitem`s, and **1,000** callback entries (one in each socket's wait queue, each pointing back to its `epitem`, and through that `epitem`, to the shared `eventpoll`). The relationship is strictly `eventpoll : epitem = 1 : N`.
+
+**It lives entirely in kernel space.** User space never sees it. The only handle you have is the integer FD returned by `epoll_create1()`. The kernel maps `your int epfd → struct file → struct eventpoll` (in kernel heap). You cannot read its fields, take its address, or touch it directly — you only influence it through syscalls (`epoll_ctl`, `epoll_wait`). Same goes for `epitem`.
+
+Here is the simplified structure of `eventpoll` from the kernel source:
+
+```c
+struct eventpoll {
+    spinlock_t lock;                    /* protects the struct */
+    struct mutex mtx;                   /* for deep sleep */
+
+    wait_queue_head_t wq;               /* ← where epoll_wait() sleepers wait */
+    wait_queue_head_t poll_wait;
+
+    struct list_head rdllist;           /* ← THE READY LIST (ready epitems) */
+
+    struct rb_root_cached rbr;          /* ← RB-tree of ALL registered epitems */
+
+    struct epitem *ovflist;             /* overflow list for re-entrancy */
+    struct file *file;                  /* the struct file for this epoll fd */
+    struct wakeup_source *ws;           /* prevents system auto-suspend */
+    struct eventpoll *parent;           /* for epoll-on-epoll (nested) */
+    /* ... a few more fields ... */
+};
+```
+
+The three fields that matter most for understanding the design:
+
+| Field | Type | Purpose |
+|---|---|---|
+| `rbr` | red-black tree | Stores **every `epitem`** you registered, indexed by FD. O(log n) lookup so `epoll_ctl MOD/DEL` is fast. |
+| `rdllist` | doubly-linked list | Stores only the **ready** `epitem`s — i.e., FDs whose callbacks fired. O(1) insertion when data arrives; this is what `epoll_wait` drains and hands back to you. |
+| `wq` | wait queue | Where **your process** sleeps when it calls `epoll_wait()`. |
+
+So the picture inside one `eventpoll` is:
+
+```
+eventpoll
+   ├── rbr        : ALL registered epitems (RB-tree — for fast ctl lookup)
+   ├── rdllist    : READY epitems only    (linked list — drained by epoll_wait)
+   └── wq         : sleeping processes   (wait queue — woken by ep_poll_callback)
+```
+
+Notice the clean division of labour: the RB-tree is the *registry* (everything you ever added), the `rdllist` is the *inbox* (just the things that have data right now), and `wq` is the *sleeping bag* (processes waiting for the inbox to fill). When a packet arrives, `ep_poll_callback` does two things in one shot: it moves the relevant `epitem` from `rbr` membership into `rdllist`, and it wakes whoever is on `wq`.
+
+This also explains why your notes keep saying the socket only carries a *callback*, not your process and not the `epoll_fd`: the socket has no idea who cares about it — it just fires `ep_poll_callback`, and that callback knows how to find its `epitem`, which knows how to find its `eventpoll`, which knows who to wake up.
+
 #### `epoll_event` (Your Code) vs `epitem` (The Kernel)
 There is a common point of confusion here worth clearing up. In your Go code (see `server/async_tcp_linux.go`), you write something like:
 
@@ -126,6 +188,60 @@ Now the full flow when a packet arrives:
 6. **Return:** The OS scheduler gives your process CPU time; `epoll_wait()` unblocks and hands you the specific FDs that triggered the wake-up so you can read them.
 
 Notice the clean separation of concerns: the socket only knows "someone cares about me" (via the callback), and the `eventpoll` is what actually tracks which process to wake and which FDs are ready.
+
+#### What Actually Sits in `wq`? (Threads, Not Epitems)
+It is very easy to walk away from the above thinking that `rdllist` and `wq` are two flavours of the same thing — both lists of stuff "waiting." They are not. They hold **completely different kinds of objects**:
+
+| Field | What it holds | Why |
+|---|---|---|
+| `rdllist` | **`epitem`s** (data descriptors — "these sockets are ready") | The kernel needs a list of *what* to report to you. |
+| `wq` | **`task_struct`s** (live threads — "these threads want to be told") | The kernel needs a list of *who* to wake up. |
+
+An `epitem` is just a struct — it does not execute code, it does not "wait." Only a *thread* can sleep, and only a thread can wake up. So `wq` holds threads, never epitems. Concretely, a Linux wait queue is a linked list of `wait_queue_entry` structs, each pointing at a `task_struct`. When your thread calls `epoll_wait()` and nothing is ready, the kernel:
+
+1. Builds a `wait_queue_entry` whose `.private = current` (the current thread).
+2. Sets the thread's state to `TASK_INTERRUPTIBLE` (sleeping).
+3. Appends that entry onto `eventpoll->wq`.
+4. Calls `schedule()` — voluntarily yields the CPU.
+
+So at that moment, **your thread literally sits inside `eventpoll->wq`.** That is its home while asleep.
+
+#### What "Wake Up" Mechanically Means
+"Wake up" is a stricter term than people assume. It does **not** mean "run the process." It is a single state transition:
+
+```
+sleeping  (TASK_INTERRUPTIBLE)
+      │
+      │  ep_poll_callback fires
+      │  → calls wake_up(eventpoll->wq)
+      ▼
+runnable  (TASK_RUNNABLE)            ← this is all "wake up" means
+      │
+      │  CPU scheduler eventually picks it
+      ▼
+actually executing on a CPU core
+      │
+      ▼
+epoll_wait() returns with the ready FDs
+```
+
+"Wake up" = flip the thread's state from sleeping to runnable **and** add it to the scheduler's runqueue. The scheduler — a separate part of the kernel — then decides when the thread actually gets a core. There can be a delay (microseconds, usually) between "woken" and "running" depending on system load. When the thread finally runs again, it returns from `schedule()`, removes its entry from `wq`, drains `rdllist` into your user-space `events` array, and `epoll_wait()` returns.
+
+#### "One Epoll → One Process" — True in the Simple Case, Not Enforced by the Kernel
+The classic single-threaded server (Redis, Node.js) does map cleanly to "one epoll ↔ one sleeping thread." That is a fine starting mental model. But the kernel does **not** enforce it. The real rules:
+
+- **A process can own zero, one, or many epoll instances.** Each `epoll_create1()` allocates a fresh `eventpoll`. Call it 5 times, you have 5 epolls, each with its own `wq` and `rdllist`.
+- **Multiple threads in the same process can share one epoll.** Threads share the FD table, so thread B can use thread A's epoll fd. If 3 threads all call `epoll_wait()` on the same epoll simultaneously, then 3 entries sit in that epoll's `wq` at once. When a packet arrives, the kernel's wake-up logic (using `WQ_FLAG_EXCLUSIVE`) typically wakes only *one* of them — this is the kernel's built-in defence against the thundering herd problem (see §9).
+- **Multiple processes can share one epoll** — after `fork()`, or by passing the fd over a Unix domain socket. Both children end up sleeping in the *same* `wq`.
+
+So the accurate statement is: **`wq` is "whoever is currently blocked in `epoll_wait` on this epoll instance, right now."** In the single-threaded case that's one thread; in the general case it's whatever set of threads happen to be sleeping there.
+
+#### Why `wq` Is a *List* — The Multi-Threaded Consideration
+Notice something structural: `wq` is a **list** of waiters, not a single `task_struct *owner` pointer. That choice is significant. If `epoll` had been designed purely for single-threaded servers, a single owner field would have been enough — you'd just store "the one thread that cares" and call `wake_up_process(owner)` when data arrives. No list needed.
+
+The reason `wq` is a *collection* is precisely the multi-threaded case: when several threads can call `epoll_wait()` on the same `eventpoll` concurrently, they all need a place to park themselves, and the kernel needs a place to find them when a callback fires. The list is the structural feature that makes multi-thread/process sharing possible at all. Strip away multi-threading from the design requirements and `wq` collapses back into a single pointer.
+
+In other words: `rdllist` exists to answer *"what is ready?"*, and `wq` exists as a *list* (rather than a single field) specifically to answer *"who are the waiters?"* in the case where there can be more than one.
 
 ## 7. Architectural Design: One `epoll` vs. Multiple `epoll`s
 A common architectural question arises when dealing with thousands of connections: *Should we use one `epoll` instance for everything, or two separate instances (one for the Server Socket to accept connections, and one for the Client Sockets to handle data)?*

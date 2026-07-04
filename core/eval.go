@@ -1,6 +1,7 @@
 package core
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -9,38 +10,36 @@ import (
 	"time"
 )
 
-func checkArguementCount(args []string, count int, c io.ReadWriter) error {
+func checkArguementCount(args []string, count int) error {
 	if len(args) < count {
-		c.Write([]byte("-ERR invalid arguments from the couter\r\n"))
-		return nil
+		return fmt.Errorf("wrong number of arguments")
 	}
 	return nil
 }
 
-func evalPING(c io.ReadWriter) error {
-	c.Write([]byte("+PONG\r\n"))
-	return nil
+func evalPING(args []string) []byte {
+	_ = args
+	return Encode("PONG")
 }
-func evalSET(args []string, c io.ReadWriter) error {
-	checkArguementCount(args, 2, c)
+
+func evalSET(args []string) []byte {
+	if err := checkArguementCount(args, 2); err != nil {
+		return Encode(err)
+	}
 	key := args[0]
 	value := args[1]
 	var durationMs int64 = 0
 	for i := 2; i < len(args); i++ {
 		if strings.ToUpper(args[i]) == "EX" {
 			if i+1 == len(args) {
-				c.Write([]byte("-ERR invalid arguments for EX\r\n"))
-				return nil
+				return Encode(errors.New("ERR invalid arguments for EX"))
 			}
 			// Convert expiry time to milliseconds
 			// For simplicity, assuming 'args[3]' is in seconds and converting to milliseconds
 			// In production, you might want to parse the unit (e.g., if it can be PX for milliseconds)
-			var err error
-			var ttlSeconds int64
-			ttlSeconds, err = strconv.ParseInt(args[i+1], 10, 64)
+			ttlSeconds, err := strconv.ParseInt(args[i+1], 10, 64)
 			if err != nil {
-				c.Write([]byte("-ERR invalid TTL value\r\n"))
-				return err
+				return Encode(errors.New("ERR invalid TTL value"))
 			}
 			durationMs = ttlSeconds * 1000
 		}
@@ -48,80 +47,91 @@ func evalSET(args []string, c io.ReadWriter) error {
 
 	obj := NewObj(value, durationMs)
 	Put(key, obj)
-	c.Write([]byte("+OK\r\n"))
-	return nil
+	return Encode("OK")
 }
-func evalGET(args []string, c io.ReadWriter) error {
-	checkArguementCount(args, 1, c)
+
+func evalGET(args []string) []byte {
+	if err := checkArguementCount(args, 1); err != nil {
+		return Encode(err)
+	}
 	obj := Get(args[0])
 	if obj == nil {
-		c.Write([]byte("-nil\r\n"))
-		return nil
+		return Encode(nil)
 	}
-	c.Write([]byte(fmt.Sprintf("+%v\r\n", obj.Value)))
-	return nil
+	return Encode(fmt.Sprintf("%v", obj.Value))
 }
-func evalTTL(args []string, c io.ReadWriter) error {
-	checkArguementCount(args, 1, c)
+
+func evalTTL(args []string) []byte {
+	if err := checkArguementCount(args, 1); err != nil {
+		return Encode(err)
+	}
 	key := args[0]
 	obj := Get(key)
 	if obj == nil {
-		c.Write([]byte(fmt.Sprintf("+%v\r\n", -2)))
-		return nil
+		return Encode(-2)
 	}
 	ttl := (obj.ExpiresAt - time.Now().UnixMilli()) / 1000
 	if ttl < 0 {
 		ttl = -1
 	}
-	c.Write([]byte(fmt.Sprintf("+%v\r\n", ttl)))
-	return nil
+	return Encode(ttl)
 }
 
-func evalDEL(args []string, c io.ReadWriter) error {
-	couter := 0
-	checkArguementCount(args, 2, c)
-	for _, value := range args {
-		couter += Del(value)
+func evalDEL(args []string) []byte {
+	if err := checkArguementCount(args, 1); err != nil {
+		return Encode(err)
 	}
-	c.Write([]byte(fmt.Sprintf("+%v\r\n", couter)))
-	return nil
+	counter := 0
+	for _, value := range args {
+		counter += Del(value)
+	}
+	return Encode(counter)
 }
 
-func evalEXPIRE(args []string, c io.ReadWriter) error {
-	checkArguementCount(args, 1, c)
+func evalEXPIRE(args []string) []byte {
+	if err := checkArguementCount(args, 2); err != nil {
+		return Encode(err)
+	}
 	key := args[0]
 	expiry := args[1]
 	obj := Get(key)
 	if obj == nil {
-		c.Write([]byte(":0\r\n"))
-		return nil
+		return Encode(0)
 	}
 	expiry_in_secs, err := strconv.ParseInt(expiry, 10, 64)
 	if err != nil {
-		return errors.New("(error) ERR value is not an integer or out of range")
+		return Encode(errors.New("ERR value is not an integer or out of range"))
 	}
 
 	expiry_in_secs = expiry_in_secs * 1000
 	obj.ExpiresAt = time.Now().UnixMilli() + expiry_in_secs
-	c.Write([]byte(":1\r\n"))
-	return nil
+	return Encode(1)
 }
 
-func EvalAndRespond(cmd *RedisCmd, c io.ReadWriter) error {
-	switch cmd.Cmd {
-	case "PING":
-		return evalPING(c)
-	case "SET":
-		return evalSET(cmd.Args, c)
-	case "GET":
-		return evalGET(cmd.Args, c)
-	case "TTL":
-		return evalTTL(cmd.Args, c)
-	case "DEL":
-		return evalDEL(cmd.Args, c)
-	case "EXPIRE":
-		return evalEXPIRE(cmd.Args, c)
-	default:
-		return evalPING(c)
+// EvalAndRespond evaluates a batch of pipelined commands and writes all of
+// the encoded responses to the connection in a single write.
+func EvalAndRespond(cmds []RedisCmd, c io.ReadWriter) error {
+	buf := bytes.NewBuffer(nil)
+	for _, cmd := range cmds {
+		var resp []byte
+		switch cmd.Cmd {
+		case "PING":
+			resp = evalPING(cmd.Args)
+		case "SET":
+			resp = evalSET(cmd.Args)
+		case "GET":
+			resp = evalGET(cmd.Args)
+		case "TTL":
+			resp = evalTTL(cmd.Args)
+		case "DEL":
+			resp = evalDEL(cmd.Args)
+		case "EXPIRE":
+			resp = evalEXPIRE(cmd.Args)
+		default:
+			resp = Encode(fmt.Errorf("ERR unknown command '%s'", cmd.Cmd))
+		}
+		buf.Write(resp)
 	}
+	_, err := c.Write(buf.Bytes())
+	return err
 }

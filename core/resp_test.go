@@ -48,7 +48,8 @@ func TestBulkStringDecode(t *testing.T) {
 	}
 	for k, v := range cases {
 		value, _ := Decode([]byte(k))
-		if v != value {
+		// Decode returns []interface{}; the bulk string is the first element.
+		if len(value) != 1 || value[0] != v {
 			t.Fail()
 		}
 	}

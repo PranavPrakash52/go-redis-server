@@ -29,6 +29,9 @@ func NewObj(value interface{}, durationMs int64) *Obj {
 }
 
 func Put(k string, obj *Obj) {
+	if len(store) >= config.MaxKeys {
+		evict()
+	}
 	store[k] = obj
 }
 
@@ -54,9 +57,15 @@ func Del(k string) int {
 
 func ClearExpired() {
 	for {
-		// Pick up to sampleSize random keys from the store.
-		// Go map iteration order is randomized, so the first N keys
-		// encountered form an effectively random sample.
+		// Pick up to SampleSize keys from the store.
+		// Note: Go does NOT shuffle map keys — it randomizes only the
+		// starting offset of iteration. The keys sit in a fixed layout
+		// (per bucket/slot), so each range yields a random *rotation* of
+		// that fixed order, and the first SampleSize keys form a random
+		// contiguous window of it — not an independent random sample.
+		// That's fine for active expiry (Redis does similar), and the
+		// offset changes on every re-range, so resampling still hits
+		// different keys across iterations.
 		keys := make([]string, 0, config.SampleSize)
 		for k := range store {
 			keys = append(keys, k)
@@ -89,5 +98,13 @@ func ClearExpired() {
 		if float64(deleted)/float64(len(keys)) <= float64(config.ActiveExpireThresholdPercent)/100 {
 			return
 		}
+	}
+}
+
+func evict() {
+	for key, _ := range store {
+		delete(store, key)
+		return
+
 	}
 }

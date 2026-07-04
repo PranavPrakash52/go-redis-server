@@ -1,7 +1,6 @@
 package server
 
 import (
-	"fmt"
 	"io"
 	"log"
 	"net"
@@ -12,7 +11,7 @@ import (
 	"go-redis-server/core"
 )
 
-func readCommand(c io.ReadWriter) (*core.RedisCmd, error) {
+func readCommand(c io.ReadWriter) ([]core.RedisCmd, error) {
 	// TODO: Max read in one shot is 512 bytes
 	// To allow input > 512 bytes, then repeated read until
 	// we get EOF or designated delimiter
@@ -21,28 +20,25 @@ func readCommand(c io.ReadWriter) (*core.RedisCmd, error) {
 	if err != nil {
 		return nil, err
 	}
-
-	tokens, err := core.DecodeArrayString(buf[:n])
+	array_of_commands, err := core.DecodeArrayString(buf[:n])
 	if err != nil {
 		return nil, err
 	}
+	// NOTE: capacity (not length!) — make with a length would pre-fill
+	// the slice with zero-value RedisCmd{Cmd:""} entries, which then get
+	// shifted in front of the real commands and produce phantom
+	// "unknown command ''" replies that desync redis-cli's reply stream.
+	redis_commands := make([]core.RedisCmd, 0, len(array_of_commands))
 
-	return &core.RedisCmd{
-		Cmd:  strings.ToUpper(tokens[0]),
-		Args: tokens[1:],
-	}, nil
-}
-
-func respondError(err error, c io.ReadWriter) {
-	c.Write([]byte(fmt.Sprintf("-%s\r\n", err)))
-}
-
-func respond(cmd *core.RedisCmd, c io.ReadWriter) {
-	resp, err := core.Encode(cmd)
-	if err != nil {
-		respondError(err, c)
+	for _, commands := range array_of_commands {
+		redis_commands = append(redis_commands,
+			core.RedisCmd{
+				Cmd:  strings.ToUpper(commands[0]),
+				Args: commands[1:],
+			})
 	}
-	c.Write(resp)
+
+	return redis_commands, nil
 }
 
 func RunSyncTCPServer() {
@@ -69,15 +65,19 @@ func RunSyncTCPServer() {
 
 		for {
 			// over the socket, continuously read the command and print it out
-			cmd, err := readCommand(c)
+			cmds, err := readCommand(c)
 			if err != nil {
 				c.Close()
 				con_clients -= 1
 				if err == io.EOF {
 					break
 				}
+				log.Println("err", err)
+				break
 			}
-			respond(cmd, c)
+			// Evaluate all pipelined commands and write all responses
+			// to the connection in a single write.
+			core.EvalAndRespond(cmds, c)
 		}
 	}
 }

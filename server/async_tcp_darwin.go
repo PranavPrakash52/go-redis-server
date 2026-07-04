@@ -93,12 +93,12 @@ func RunAsyncTCPServerDarwin() error {
 				}
 			} else {
 				comm := core.FDComm{Fd: int(events[i].Ident)}
-				cmd, err := readCommand(comm)
+				cmds, err := readCommand(comm)
 				if err != nil {
 					syscall.Close(int(events[i].Ident))
 					continue
 				}
-				core.EvalAndRespond(cmd, comm)
+				core.EvalAndRespond(cmds, comm)
 			}
 		}
 
