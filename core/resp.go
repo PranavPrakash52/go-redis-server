@@ -1,9 +1,14 @@
 package core
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 )
+
+func encodeString(v string) []byte {
+	return []byte(fmt.Sprintf("$%d\r\n%s\r\n", len(v), v))
+}
 
 // Encode serializes a value into its RESP-encoded byte representation.
 // Supported value types:
@@ -23,6 +28,12 @@ func Encode(v interface{}) []byte {
 		return []byte(fmt.Sprintf(":%d\r\n", v))
 	case error:
 		return []byte(fmt.Sprintf("-%s\r\n", v.Error()))
+	case []string:
+		buf := bytes.NewBuffer(nil)
+		for _, str_ := range v {
+			buf.Write(encodeString(str_))
+		}
+		return []byte(fmt.Sprintf("*%d\r\n%s", len(v), buf.Bytes()))
 	default:
 		return []byte(fmt.Sprintf("+%v\r\n", v))
 	}

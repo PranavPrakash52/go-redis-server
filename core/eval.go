@@ -127,6 +127,9 @@ func EvalAndRespond(cmds []RedisCmd, c io.ReadWriter) error {
 			resp = evalDEL(cmd.Args)
 		case "EXPIRE":
 			resp = evalEXPIRE(cmd.Args)
+		case "BGREWRITEAOF":
+			go WriteAof()
+			resp = Encode("OK")
 		default:
 			resp = Encode(fmt.Errorf("ERR unknown command '%s'", cmd.Cmd))
 		}
