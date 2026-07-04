@@ -44,8 +44,6 @@ func readLength(data []byte) (int, int) {
 	return 0, 0
 }
 
-// reads a RESP encoded simple string from data and returns
-// the string, the delta, and the error
 func readSimpleString(data []byte) (string, int, error) {
 	// first character +
 	pos := 1
@@ -56,16 +54,11 @@ func readSimpleString(data []byte) (string, int, error) {
 	return string(data[1:pos]), pos + 2, nil
 }
 
-// reads a RESP encoded error from data and returns
-// the error string, the delta, and the error
 func readError(data []byte) (string, int, error) {
 	return readSimpleString(data)
 }
 
-// reads a RESP encoded integer from data and returns
-// the intger value, the delta, and the error
 func readInt64(data []byte) (int64, int, error) {
-	// first character :
 	pos := 1
 	var value int64 = 0
 
@@ -76,14 +69,8 @@ func readInt64(data []byte) (int64, int, error) {
 	return value, pos + 2, nil
 }
 
-// reads a RESP encoded string from data and returns
-// the string, the delta, and the error
 func readBulkString(data []byte) (string, int, error) {
-	// first character $
 	pos := 1
-
-	// reading the length and forwarding the pos by
-	// the lenth of the integer + the first special character
 	len, delta := readLength(data[pos:])
 	pos += delta
 
@@ -91,13 +78,9 @@ func readBulkString(data []byte) (string, int, error) {
 	return string(data[pos:(pos + len)]), pos + len + 2, nil
 }
 
-// reads a RESP encoded array from data and returns
-// the array, the delta, and the error
 func readArray(data []byte) (interface{}, int, error) {
-	// first character *
 	pos := 1
 
-	// reading the length
 	count, delta := readLength(data[pos:])
 	pos += delta
 
