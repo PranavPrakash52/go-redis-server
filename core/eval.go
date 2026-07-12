@@ -45,7 +45,9 @@ func evalSET(args []string) []byte {
 		}
 	}
 
-	obj := NewObj(value, durationMs)
+	// All string SETs map to the string type with the raw encoding
+	// (value held as a Go string / byte representation).
+	obj := NewObj(value, durationMs, ObjTypeString, ObjEncodingRaw)
 	Put(key, obj)
 	return Encode("OK")
 }
@@ -88,6 +90,34 @@ func evalDEL(args []string) []byte {
 	return Encode(counter)
 }
 
+func evalINCR(args []string) []byte {
+	if err := checkArguementCount(args, 1); err != nil {
+		return Encode(err)
+	}
+	key := args[0]
+	obj := Get(key)
+
+	// New key: seed it at 1 with string type + int encoding.
+	if obj == nil {
+		newObj := NewObj(int64(1), 0, ObjTypeString, ObjEncodingInt)
+		Put(key, newObj)
+		return Encode(int64(1))
+	}
+
+	// Existing key: only valid if it is a string encoded as an int.
+	if GetType(obj.TypeEncoding) != ObjTypeString || GetEncoding(obj.TypeEncoding) != ObjEncodingInt {
+		return Encode(errors.New("ERR value is not an integer or out of range"))
+	}
+
+	val, ok := obj.Value.(int64)
+	if !ok {
+		return Encode(errors.New("ERR value is not an integer or out of range"))
+	}
+	val++
+	obj.Value = val
+	return Encode(val)
+}
+
 func evalEXPIRE(args []string) []byte {
 	if err := checkArguementCount(args, 2); err != nil {
 		return Encode(err)
@@ -127,6 +157,8 @@ func EvalAndRespond(cmds []RedisCmd, c io.ReadWriter) error {
 			resp = evalDEL(cmd.Args)
 		case "EXPIRE":
 			resp = evalEXPIRE(cmd.Args)
+		case "INCR":
+			resp = evalINCR(cmd.Args)
 		case "BGREWRITEAOF":
 			WriteAof()
 			resp = Encode("OK")
