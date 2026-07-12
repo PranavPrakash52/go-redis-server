@@ -297,6 +297,46 @@ It is critical to distinguish between the **three** different queues involved in
 2. **The Eventpoll Wait Queue (`eventpoll->wq`, belongs to the `epoll` instance):** This holds the **process(es)** that are currently sleeping inside `epoll_wait()`.
 3. **The Ready List (`eventpoll->rdllist`, belongs to the `epoll` instance):** This keeps track of *which File Descriptors* currently have data ready to be read.
 
+### What's Actually Inside the `sk_wq` Entry?
+It is tempting to think the socket wait queue entry carries everything needed to wake a thread — both *which epitem to add to the ready list* and *which thread to wake up*. **It does not.** The `sk_wq` entry only knows the epitem side of the story. The thread side lives in a separate queue (`eventpoll->wq`).
+
+When you register an FD with `epoll_ctl(EPOLL_CTL_ADD)`, the kernel creates a `struct eppoll_entry` — the bridge between a socket and an `epitem` — and inserts it into the socket's `sk_wq`:
+
+```c
+struct eppoll_entry {
+    struct list_head    llink;     // links into eventpoll->poll_wait
+    struct epitem      *base;      // ← pointer back to the epitem
+    wait_queue_entry_t  wait;      // the entry that actually sits in sk_wq
+    wait_queue_head_t  *whead;     // back-pointer to the socket's wait queue head
+};
+```
+
+Inside the embedded `wait_queue_entry_t`:
+- `.func  = ep_poll_callback` — the function the kernel will invoke when data arrives.
+- `.private` — points back at the `eppoll_entry` (so the callback can recover the `epitem` via `container_of`).
+
+That is the **full extent** of what the entry carries: a callback function + a pointer to the `epitem`. No `task_struct`, no thread reference, no PID.
+
+#### Why the Split?
+The socket is deliberately decoupled from processes. A socket doesn't care whether 0, 1, or 50 threads are interested in it — it only records "*someone* cares, here's their callback." The mapping from "epoll instance → threads currently waiting" is maintained separately, *inside* the `eventpoll`'s `wq`, and it changes every time a thread enters or leaves `epoll_wait()`.
+
+If the thread pointer were baked into the `sk_wq` entry, the kernel would have to rewrite socket state on every sleep/wake — and the multi-threaded case (many threads sharing one epoll, but only one `sk_wq` entry per epoll instance) would be impossible to represent.
+
+#### The Indirection Chain When Data Arrives
+```
+sk_wq entry  ──knows──>  epitem  ──knows──>  eventpoll
+   (callback)                                          │
+                                                       ├──> rdllist  (epitem added here)
+                                                       └──> wq       (threads woken from here)
+```
+
+So the callback discovers *who to wake* indirectly: it follows `epitem → eventpoll`, and then `wake_up(eventpoll->wq)` walks **that** list — the list of `task_struct`s sitting in `epoll_wait()` — to flip their state from sleeping to runnable.
+
+| Question | Answered by | Holds |
+|---|---|---|
+| *Which epitem is ready?* | `sk_wq` entry | callback + `epitem` pointer |
+| *Which thread(s) to wake?* | `eventpoll->wq` | `task_struct`s |
+
 ### The True Flow of an Interrupt
 What happens if your application is awake and processing 5 File Descriptors, and suddenly data arrives for a 6th File Descriptor?
 
