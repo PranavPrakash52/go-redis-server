@@ -138,6 +138,16 @@ func evalEXPIRE(args []string) []byte {
 	return Encode(1)
 }
 
+func evalINFO(args []string) []byte {
+	buf := bytes.NewBuffer(nil)
+	buf.WriteString("# Keyspace\r\n")
+	for i := range Infostats {
+		buf.WriteString(fmt.Sprintf("db%d:keys=%d,expires=0,avg_ttl=0\r\n", i, Infostats[i]["keys"]))
+	}
+	return encodeString(buf.String())
+
+}
+
 // EvalAndRespond evaluates a batch of pipelined commands and writes all of
 // the encoded responses to the connection in a single write.
 func EvalAndRespond(cmds []RedisCmd, c io.ReadWriter) error {
@@ -159,6 +169,8 @@ func EvalAndRespond(cmds []RedisCmd, c io.ReadWriter) error {
 			resp = evalEXPIRE(cmd.Args)
 		case "INCR":
 			resp = evalINCR(cmd.Args)
+		case "INFO":
+			resp = evalINFO(cmd.Args)
 		case "BGREWRITEAOF":
 			WriteAof()
 			resp = Encode("OK")

@@ -15,6 +15,9 @@ type Obj struct {
 
 func init() {
 	store = make(map[string]*Obj)
+	for i := range Infostats {
+		Infostats[i] = make(map[string]int)
+	}
 }
 
 func NewObj(value interface{}, durationMs int64, typ, enc uint8) *Obj {
@@ -34,6 +37,9 @@ func Put(k string, obj *Obj) {
 	if len(store) >= config.MaxKeys {
 		evict()
 	}
+	if _, exists := store[k]; !exists {
+		Infostats[0]["keys"]++
+	}
 	store[k] = obj
 }
 
@@ -52,6 +58,7 @@ func Del(k string) int {
 	v := store[k]
 	if v != nil {
 		delete(store, k)
+		Infostats[0]["keys"]--
 		return 1
 	}
 	return 0
@@ -89,7 +96,7 @@ func ClearExpired() {
 				continue
 			}
 			if obj.ExpiresAt != -1 && obj.ExpiresAt <= now {
-				delete(store, k)
+				Del(k)
 				deleted++
 			}
 		}
@@ -105,7 +112,7 @@ func ClearExpired() {
 
 func evict() {
 	for key, _ := range store {
-		delete(store, key)
+		Del(key)
 		return
 
 	}
